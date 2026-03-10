@@ -66,6 +66,7 @@ static const WCHAR* g_VulnerableDriverIndicators[] =
     L"\\dbutil_2_3.sys",
     L"\\asupio.sys",
     L"\\eneio64.sys",
+    L"\\device\\nal",
 };
 
 static
@@ -113,23 +114,52 @@ DrvDetectContainsSubstrInsensitive(
     _In_ PCWSTR Substring
 )
 {
-    UNICODE_STRING pat;
-    WCHAR buf[128];
-    NTSTATUS status;
+    UNICODE_STRING needle;
+    USHORT hayChars;
+    USHORT needleChars;
+    USHORT i;
+    USHORT j;
+    WCHAR hayChar;
+    WCHAR needleChar;
 
     if (Haystack == NULL || Haystack->Buffer == NULL || Haystack->Length == 0 || Substring == NULL)
     {
         return FALSE;
     }
 
-    status = RtlStringCchPrintfW(buf, RTL_NUMBER_OF(buf), L"*%ws*", Substring);
-    if (!NT_SUCCESS(status))
+    RtlInitUnicodeString(&needle, Substring);
+    if (needle.Buffer == NULL || needle.Length == 0)
     {
         return FALSE;
     }
 
-    RtlInitUnicodeString(&pat, buf);
-    return FsRtlIsNameInExpression(&pat, (PUNICODE_STRING)Haystack, TRUE, NULL);
+    hayChars = Haystack->Length / sizeof(WCHAR);
+    needleChars = needle.Length / sizeof(WCHAR);
+
+    if (needleChars > hayChars)
+    {
+        return FALSE;
+    }
+
+    for (i = 0; i <= (USHORT)(hayChars - needleChars); i++)
+    {
+        for (j = 0; j < needleChars; j++)
+        {
+            hayChar = RtlUpcaseUnicodeChar(Haystack->Buffer[i + j]);
+            needleChar = RtlUpcaseUnicodeChar(needle.Buffer[j]);
+            if (hayChar != needleChar)
+            {
+                break;
+            }
+        }
+
+        if (j == needleChars)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static
@@ -237,6 +267,11 @@ DrvDetectIsLikelyKdmapperImagePath(
     USHORT baseStart;
     USHORT baseLen;
     BOOLEAN hasDot = FALSE;
+    BOOLEAN hasSysExtension = FALSE;
+    BOOLEAN tempLikePath = FALSE;
+    BOOLEAN hasUserTemp = FALSE;
+    BOOLEAN hasWindowsTemp = FALSE;
+    BOOLEAN allAsciiName = TRUE;
 
     if (ValueData == NULL || ValueData->Buffer == NULL || ValueData->Length == 0)
     {
@@ -248,16 +283,11 @@ DrvDetectIsLikelyKdmapperImagePath(
         return FALSE;
     }
 
-    if (!DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\"))
-    {
-        return FALSE;
-    }
-
-    if (!DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\") &&
-        !DrvDetectContainsSubstrInsensitive(ValueData, L"\\temp\\"))
-    {
-        return FALSE;
-    }
+    hasUserTemp =
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\");
+    hasWindowsTemp = DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\");
+    tempLikePath = hasUserTemp || hasWindowsTemp;
 
     if (DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\system32\\drivers\\"))
     {
@@ -267,6 +297,11 @@ DrvDetectIsLikelyKdmapperImagePath(
     if (DrvDetectContainsSubstrInsensitive(ValueData, L"iqvw64e"))
     {
         return TRUE;
+    }
+
+    if (!tempLikePath)
+    {
+        return FALSE;
     }
 
     end = ValueData->Length / sizeof(WCHAR);
@@ -285,7 +320,7 @@ DrvDetectIsLikelyKdmapperImagePath(
     }
 
     baseLen = end - baseStart;
-    if (baseLen < 8 || baseLen > 40)
+    if (baseLen < 8 || baseLen > 44)
     {
         return FALSE;
     }
@@ -296,6 +331,16 @@ DrvDetectIsLikelyKdmapperImagePath(
         if (c == L'.')
         {
             hasDot = TRUE;
+            if ((i + 4) == end &&
+                (ValueData->Buffer[i + 1] == L's' || ValueData->Buffer[i + 1] == L'S') &&
+                (ValueData->Buffer[i + 2] == L'y' || ValueData->Buffer[i + 2] == L'Y') &&
+                (ValueData->Buffer[i + 3] == L's' || ValueData->Buffer[i + 3] == L'S'))
+            {
+                hasSysExtension = TRUE;
+                break;
+            }
+
+            allAsciiName = FALSE;
             break;
         }
 
@@ -304,11 +349,188 @@ DrvDetectIsLikelyKdmapperImagePath(
               (c >= L'A' && c <= L'Z') ||
               c == L'_'))
         {
-            return FALSE;
+            allAsciiName = FALSE;
+            break;
         }
     }
 
-    return (hasDot == FALSE);
+    if (!allAsciiName)
+    {
+        return FALSE;
+    }
+
+    if (!hasDot)
+    {
+        return TRUE;
+    }
+
+    return hasSysExtension;
+}
+
+static
+BOOLEAN
+DrvDetectShouldBlockDriverServiceImagePath(
+    _In_ PCUNICODE_STRING ValueData
+)
+{
+    SIZE_T i;
+
+    if (ValueData == NULL || ValueData->Buffer == NULL || ValueData->Length == 0)
+    {
+        return FALSE;
+    }
+
+    if (DrvDetectContainsSubstrInsensitive(ValueData, L"\\??\\") &&
+        ((DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
+          DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\")) ||
+         DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\")))
+    {
+        return TRUE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(g_VulnerableDriverIndicators); i++)
+    {
+        if (DrvDetectContainsSubstrInsensitive(ValueData, g_VulnerableDriverIndicators[i]))
+        {
+            return TRUE;
+        }
+    }
+
+    return DrvDetectIsLikelyKdmapperImagePath(ValueData);
+}
+
+static
+VOID
+DrvDetectDescribeRegistryWrite(
+    _In_ PCUNICODE_STRING KeyName,
+    _In_ PCUNICODE_STRING ValueName,
+    _In_ ULONG ValueType,
+    _In_opt_ PCUNICODE_STRING ValueData
+)
+{
+    WCHAR msg[220];
+
+    if (KeyName == NULL || ValueName == NULL)
+    {
+        return;
+    }
+
+    if (ValueData != NULL &&
+        ValueData->Buffer != NULL &&
+        ValueData->Length > 0 &&
+        (ValueType == REG_SZ || ValueType == REG_EXPAND_SZ))
+    {
+        RtlStringCchPrintfW(
+            msg,
+            RTL_NUMBER_OF(msg),
+            L"Registry write key=%wZ value=%wZ data=%wZ",
+            KeyName,
+            ValueName,
+            ValueData);
+    }
+    else if (ValueType == REG_DWORD && ValueData != NULL && ValueData->Buffer != NULL && ValueData->Length >= sizeof(ULONG))
+    {
+        RtlStringCchPrintfW(
+            msg,
+            RTL_NUMBER_OF(msg),
+            L"Registry write key=%wZ value=%wZ dword=%lu",
+            KeyName,
+            ValueName,
+            *(ULONG*)ValueData->Buffer);
+    }
+    else
+    {
+        RtlStringCchPrintfW(
+            msg,
+            RTL_NUMBER_OF(msg),
+            L"Registry write key=%wZ value=%wZ type=%lu size=%u",
+            KeyName,
+            ValueName,
+            ValueType,
+            ValueData != NULL ? ValueData->Length : 0);
+    }
+
+    DrvDetectPushAlert(AlertTypeKernelImageSuspicious, HandleToULong(PsGetCurrentProcessId()), msg);
+}
+
+static
+VOID
+DrvDetectInitRegistryStringValue(
+    _Out_ PUNICODE_STRING ValueData,
+    _In_reads_bytes_(DataSize) PVOID Data,
+    _In_ ULONG DataSize
+)
+{
+    USHORT lengthBytes;
+
+    ValueData->Buffer = (PWCH)Data;
+    lengthBytes = (USHORT)min(DataSize, (ULONG)0xFFFE);
+
+    while (lengthBytes >= sizeof(WCHAR))
+    {
+        WCHAR tail = *((PWCHAR)((PUCHAR)Data + lengthBytes - sizeof(WCHAR)));
+        if (tail != UNICODE_NULL)
+        {
+            break;
+        }
+
+        lengthBytes -= sizeof(WCHAR);
+    }
+
+    ValueData->Length = lengthBytes;
+    ValueData->MaximumLength = lengthBytes;
+}
+
+static
+BOOLEAN
+DrvDetectIsServicesRegistryPath(
+    _In_opt_ PCUNICODE_STRING KeyName
+)
+{
+    if (KeyName == NULL || KeyName->Buffer == NULL || KeyName->Length == 0)
+    {
+        return FALSE;
+    }
+
+    if (!DrvDetectContainsSubstrInsensitive(KeyName, L"\\registry\\machine\\system\\"))
+    {
+        return FALSE;
+    }
+
+    if (!(DrvDetectContainsSubstrInsensitive(KeyName, L"\\currentcontrolset\\services\\") ||
+          DrvDetectContainsSubstrInsensitive(KeyName, L"\\controlset")))
+    {
+        return FALSE;
+    }
+
+    return DrvDetectContainsSubstrInsensitive(KeyName, L"\\services\\");
+}
+
+static
+BOOLEAN
+DrvDetectIsCiConfigRegistryPath(
+    _In_opt_ PCUNICODE_STRING KeyName
+)
+{
+    if (KeyName == NULL || KeyName->Buffer == NULL || KeyName->Length == 0)
+    {
+        return FALSE;
+    }
+
+    if (!DrvDetectContainsSubstrInsensitive(KeyName, L"\\registry\\machine\\system\\"))
+    {
+        return FALSE;
+    }
+
+    if (!(DrvDetectContainsSubstrInsensitive(KeyName, L"\\currentcontrolset\\control\\ci\\config") ||
+          DrvDetectContainsSubstrInsensitive(KeyName, L"\\controlset001\\control\\ci\\config") ||
+          DrvDetectContainsSubstrInsensitive(KeyName, L"\\controlset002\\control\\ci\\config") ||
+          DrvDetectContainsSubstrInsensitive(KeyName, L"\\controlset003\\control\\ci\\config")))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static
@@ -329,6 +551,7 @@ DrvDetectRegistryCallback(
     BOOLEAN isTypeWrite = FALSE;
     BOOLEAN isImagePathWrite = FALSE;
     BOOLEAN shouldBlock = FALSE;
+    BOOLEAN immediateImagePathBlock = FALSE;
     KLOCK_QUEUE_HANDLE lockHandle;
     ULONG i;
     LONG freeIndex = -1;
@@ -360,6 +583,36 @@ DrvDetectRegistryCallback(
         return STATUS_SUCCESS;
     }
 
+    if (isImagePathWrite && (valueType == REG_SZ || valueType == REG_EXPAND_SZ))
+    {
+        WCHAR observedMsg[220];
+
+        DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize);
+
+        RtlStringCchPrintfW(
+            observedMsg,
+            RTL_NUMBER_OF(observedMsg),
+            L"Observed ImagePath: %wZ",
+            &valueData);
+        DrvDetectPushAlert(
+            AlertTypeKernelImageSuspicious,
+            HandleToULong(PsGetCurrentProcessId()),
+            observedMsg);
+
+        if (DrvDetectShouldBlockDriverServiceImagePath(&valueData))
+        {
+            WCHAR earlyMsg[220];
+
+            RtlStringCchPrintfW(
+                earlyMsg,
+                RTL_NUMBER_OF(earlyMsg),
+                L"Blocked suspicious ImagePath write before service resolution: %wZ",
+                &valueData);
+            DrvDetectPushAlert(AlertTypeProcessBlocked, HandleToULong(PsGetCurrentProcessId()), earlyMsg);
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
     status = CmCallbackGetKeyObjectIDEx(
         &g_DrvDetect.RegistryCookie,
         setInfo->Object,
@@ -371,10 +624,10 @@ DrvDetectRegistryCallback(
         return STATUS_SUCCESS;
     }
 
-    isServicesKey = DrvDetectContainsSubstrInsensitive(keyName, L"\\registry\\machine\\system\\currentcontrolset\\services\\");
+    isServicesKey = DrvDetectIsServicesRegistryPath(keyName);
     if (!isServicesKey)
     {
-        if (DrvDetectContainsSubstrInsensitive(keyName, L"\\registry\\machine\\system\\currentcontrolset\\control\\ci\\config") &&
+        if (DrvDetectIsCiConfigRegistryPath(keyName) &&
             DrvDetectEndsWithInsensitive(setInfo->ValueName, L"VulnerableDriverBlocklistEnable") &&
             valueType == REG_DWORD &&
             setInfo->DataSize >= sizeof(ULONG))
@@ -435,6 +688,11 @@ DrvDetectRegistryCallback(
 
     if (isTypeWrite && valueType == REG_DWORD && setInfo->DataSize >= sizeof(ULONG))
     {
+        valueData.Buffer = (PWCH)setInfo->Data;
+        valueData.Length = sizeof(ULONG);
+        valueData.MaximumLength = sizeof(ULONG);
+        DrvDetectDescribeRegistryWrite(keyName, setInfo->ValueName, valueType, &valueData);
+
         dwordValue = *(ULONG*)setInfo->Data;
         if (dwordValue == 1)
         {
@@ -444,13 +702,13 @@ DrvDetectRegistryCallback(
 
     if (isImagePathWrite && (valueType == REG_SZ || valueType == REG_EXPAND_SZ))
     {
-        valueData.Buffer = (PWCH)setInfo->Data;
-        valueData.Length = (USHORT)min(setInfo->DataSize, (ULONG)0xFFFE);
-        valueData.MaximumLength = valueData.Length;
+        DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize);
+        DrvDetectDescribeRegistryWrite(keyName, setInfo->ValueName, valueType, &valueData);
 
-        if (DrvDetectIsLikelyKdmapperImagePath(&valueData))
+        if (DrvDetectShouldBlockDriverServiceImagePath(&valueData))
         {
             g_ServiceTracks[matchIndex].HasSuspiciousImagePath = TRUE;
+            immediateImagePathBlock = TRUE;
             RtlStringCchCopyNW(
                 g_ServiceTracks[matchIndex].ImagePath,
                 RTL_NUMBER_OF(g_ServiceTracks[matchIndex].ImagePath),
@@ -459,7 +717,7 @@ DrvDetectRegistryCallback(
         }
     }
 
-    if (g_ServiceTracks[matchIndex].HasKernelType && g_ServiceTracks[matchIndex].HasSuspiciousImagePath)
+    if (immediateImagePathBlock || (g_ServiceTracks[matchIndex].HasKernelType && g_ServiceTracks[matchIndex].HasSuspiciousImagePath))
     {
         shouldBlock = TRUE;
     }
@@ -876,6 +1134,10 @@ DriverEntry(
     RtlZeroMemory(&g_DrvDetect, sizeof(g_DrvDetect));
     KeInitializeSpinLock(&g_DrvDetect.AlertLock);
     KeInitializeSpinLock(&g_DrvDetect.ServiceTrackLock);
+    DrvDetectPushAlert(
+        AlertTypeKernelImageSuspicious,
+        0,
+        L"DrvDetect build=trace2-controlset loaded.");
 
     WDF_DRIVER_CONFIG_INIT(&config, WDF_NO_EVENT_CALLBACK);
     config.DriverInitFlags = WdfDriverInitNonPnpDriver;

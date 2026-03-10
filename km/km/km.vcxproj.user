@@ -3,4 +3,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TestCertificate>CN="WDKTestCert max,134172894077374092" | 38A1BDE8F3E54ACD80983AB103633FB0B61A824E</TestCertificate>
   </PropertyGroup>
+  <PropertyGroup>
+    <ShowAllFiles>true</ShowAllFiles>
+  </PropertyGroup>
 </Project>
