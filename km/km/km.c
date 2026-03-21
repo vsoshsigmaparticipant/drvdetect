@@ -16,6 +16,7 @@ EVT_WDF_DRIVER_UNLOAD DrvDetectEvtDriverUnload;
 typedef struct _DRVDETECT_GLOBALS
 {
     WDFDEVICE ControlDevice;
+    volatile LONG BlockingState;
     BOOLEAN ProcessNotifyRegistered;
     BOOLEAN ProcessNotifyLegacyRegistered;
     BOOLEAN ImageNotifyRegistered;
@@ -75,6 +76,24 @@ DrvDetectPushAlert(
     _In_ ULONG Type,
     _In_ ULONG ProcessId,
     _In_ PCWSTR Message
+);
+
+static
+BOOLEAN
+DrvDetectIsBlockingEnabled(
+    VOID
+);
+
+static
+ULONG
+DrvDetectGetPendingAlertCount(
+    VOID
+);
+
+static
+VOID
+DrvDetectFillState(
+    _Out_ DRVDETECT_STATE* State
 );
 
 static
@@ -210,6 +229,43 @@ DrvDetectIsBlockedMapperPath(
     }
 
     return FALSE;
+}
+
+static
+BOOLEAN
+DrvDetectIsBlockingEnabled(
+    VOID
+)
+{
+    return InterlockedCompareExchange(&g_DrvDetect.BlockingState, 0, 0) == DrvDetectBlockingOn;
+}
+
+static
+ULONG
+DrvDetectGetPendingAlertCount(
+    VOID
+)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    ULONG count;
+
+    KeAcquireInStackQueuedSpinLock(&g_DrvDetect.AlertLock, &lockHandle);
+    count = g_DrvDetect.AlertCount;
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    return count;
+}
+
+static
+VOID
+DrvDetectFillState(
+    _Out_ DRVDETECT_STATE* State
+)
+{
+    RtlZeroMemory(State, sizeof(*State));
+    State->Version = DRVDETECT_STATE_VERSION;
+    State->BlockingState = DrvDetectIsBlockingEnabled() ? DrvDetectBlockingOn : DrvDetectBlockingOff;
+    State->PendingAlerts = DrvDetectGetPendingAlertCount();
 }
 
 static
@@ -557,12 +613,15 @@ DrvDetectRegistryCallback(
     LONG freeIndex = -1;
     LONG matchIndex = -1;
     WCHAR msg[220];
+    WCHAR trackedImagePath[160];
     ULONG_PTR objectId = 0;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(CallbackContext);
 
     notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
+    RtlZeroMemory(trackedImagePath, sizeof(trackedImagePath));
+
     if (notifyClass != RegNtPreSetValueKey || Argument2 == NULL)
     {
         return STATUS_SUCCESS;
@@ -606,10 +665,18 @@ DrvDetectRegistryCallback(
             RtlStringCchPrintfW(
                 earlyMsg,
                 RTL_NUMBER_OF(earlyMsg),
-                L"Blocked suspicious ImagePath write before service resolution: %wZ",
+                DrvDetectIsBlockingEnabled() ?
+                    L"Blocked suspicious ImagePath write before service resolution: %wZ" :
+                    L"Observed suspicious ImagePath write while blocking is off: %wZ",
                 &valueData);
-            DrvDetectPushAlert(AlertTypeProcessBlocked, HandleToULong(PsGetCurrentProcessId()), earlyMsg);
-            return STATUS_ACCESS_DENIED;
+            DrvDetectPushAlert(
+                DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+                HandleToULong(PsGetCurrentProcessId()),
+                earlyMsg);
+            if (DrvDetectIsBlockingEnabled())
+            {
+                return STATUS_ACCESS_DENIED;
+            }
         }
     }
 
@@ -636,11 +703,17 @@ DrvDetectRegistryCallback(
             if (dwordValue == 0)
             {
                 DrvDetectPushAlert(
-                    AlertTypeProcessBlocked,
+                    DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
                     HandleToULong(PsGetCurrentProcessId()),
-                    L"Blocked attempt to disable VulnerableDriverBlocklistEnable.");
+                    DrvDetectIsBlockingEnabled() ?
+                        L"Blocked attempt to disable VulnerableDriverBlocklistEnable." :
+                        L"Observed attempt to disable VulnerableDriverBlocklistEnable while blocking is off.");
                 CmCallbackReleaseKeyObjectIDEx(keyName);
-                return STATUS_ACCESS_DENIED;
+                if (DrvDetectIsBlockingEnabled())
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+                return STATUS_SUCCESS;
             }
         }
 
@@ -720,6 +793,10 @@ DrvDetectRegistryCallback(
     if (immediateImagePathBlock || (g_ServiceTracks[matchIndex].HasKernelType && g_ServiceTracks[matchIndex].HasSuspiciousImagePath))
     {
         shouldBlock = TRUE;
+        RtlStringCchCopyW(
+            trackedImagePath,
+            RTL_NUMBER_OF(trackedImagePath),
+            g_ServiceTracks[matchIndex].ImagePath);
     }
 
     KeReleaseInStackQueuedSpinLock(&lockHandle);
@@ -729,12 +806,21 @@ DrvDetectRegistryCallback(
         RtlStringCchPrintfW(
             msg,
             RTL_NUMBER_OF(msg),
-            L"Blocked kdmapper-like vulnerable-driver staging: key=%wZ img=%ws",
+            DrvDetectIsBlockingEnabled() ?
+                L"Blocked kdmapper-like vulnerable-driver staging: key=%wZ img=%ws" :
+                L"Observed kdmapper-like vulnerable-driver staging while blocking is off: key=%wZ img=%ws",
             keyName,
-            g_ServiceTracks[matchIndex].ImagePath);
-        DrvDetectPushAlert(AlertTypeProcessBlocked, HandleToULong(PsGetCurrentProcessId()), msg);
+            trackedImagePath);
+        DrvDetectPushAlert(
+            DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+            HandleToULong(PsGetCurrentProcessId()),
+            msg);
         CmCallbackReleaseKeyObjectIDEx(keyName);
-        return STATUS_ACCESS_DENIED;
+        if (DrvDetectIsBlockingEnabled())
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+        return STATUS_SUCCESS;
     }
 
     CmCallbackReleaseKeyObjectIDEx(keyName);
@@ -820,16 +906,24 @@ DrvDetectProcessNotifyEx(
 
     if (DrvDetectIsBlockedMapperPath(CreateInfo->ImageFileName))
     {
-        CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        if (DrvDetectIsBlockingEnabled())
+        {
+            CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        }
 
         RtlStringCchPrintfW(
             message,
             RTL_NUMBER_OF(message),
-            L"Blocked known mapper process: %wZ (pid=%lu)",
+            DrvDetectIsBlockingEnabled() ?
+                L"Blocked known mapper process: %wZ (pid=%lu)" :
+                L"Observed known mapper process while blocking is off: %wZ (pid=%lu)",
             CreateInfo->ImageFileName,
             HandleToULong(ProcessId));
 
-        DrvDetectPushAlert(AlertTypeProcessBlocked, HandleToULong(ProcessId), message);
+        DrvDetectPushAlert(
+            DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+            HandleToULong(ProcessId),
+            message);
         return;
     }
 }
@@ -873,10 +967,18 @@ DrvDetectProcessNotifyLegacy(
         RtlStringCchPrintfW(
             msg,
             RTL_NUMBER_OF(msg),
-            L"Legacy callback matched mapper path: %wZ",
+            DrvDetectIsBlockingEnabled() ?
+                L"Legacy callback matched mapper path: %wZ" :
+                L"Legacy callback observed mapper path while blocking is off: %wZ",
             processPath);
-        DrvDetectPushAlert(AlertTypeProcessBlocked, HandleToULong(ProcessId), msg);
-        DrvDetectTryTerminateProcess(ProcessId, STATUS_NOT_SUPPORTED);
+        DrvDetectPushAlert(
+            DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+            HandleToULong(ProcessId),
+            msg);
+        if (DrvDetectIsBlockingEnabled())
+        {
+            DrvDetectTryTerminateProcess(ProcessId, STATUS_NOT_SUPPORTED);
+        }
     }
 
     ExFreePool(processPath);
@@ -1048,9 +1150,10 @@ DrvDetectEvtIoDeviceControl(
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
     size_t bytesReturned = 0;
     DRVDETECT_ALERT* outAlert = NULL;
+    DRVDETECT_STATE* outState = NULL;
+    DRVDETECT_STATE* inState = NULL;
 
     UNREFERENCED_PARAMETER(Queue);
-    UNREFERENCED_PARAMETER(InputBufferLength);
 
     if (IoControlCode == IOCTL_DRVDETECT_GET_ALERT)
     {
@@ -1073,6 +1176,67 @@ DrvDetectEvtIoDeviceControl(
         }
 
         bytesReturned = sizeof(DRVDETECT_ALERT);
+        status = STATUS_SUCCESS;
+    }
+    else if (IoControlCode == IOCTL_DRVDETECT_GET_STATE)
+    {
+        if (OutputBufferLength < sizeof(DRVDETECT_STATE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            goto Exit;
+        }
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(DRVDETECT_STATE), (PVOID*)&outState, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            goto Exit;
+        }
+
+        DrvDetectFillState(outState);
+        bytesReturned = sizeof(DRVDETECT_STATE);
+        status = STATUS_SUCCESS;
+    }
+    else if (IoControlCode == IOCTL_DRVDETECT_SET_STATE)
+    {
+        if (InputBufferLength < sizeof(DRVDETECT_STATE))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            goto Exit;
+        }
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(DRVDETECT_STATE), (PVOID*)&inState, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            goto Exit;
+        }
+
+        if (inState->Version != DRVDETECT_STATE_VERSION ||
+            (inState->BlockingState != DrvDetectBlockingOff && inState->BlockingState != DrvDetectBlockingOn))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto Exit;
+        }
+
+        InterlockedExchange(&g_DrvDetect.BlockingState, (LONG)inState->BlockingState);
+
+        if (OutputBufferLength >= sizeof(DRVDETECT_STATE))
+        {
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(DRVDETECT_STATE), (PVOID*)&outState, NULL);
+            if (!NT_SUCCESS(status))
+            {
+                goto Exit;
+            }
+
+            DrvDetectFillState(outState);
+            bytesReturned = sizeof(DRVDETECT_STATE);
+        }
+
+        DrvDetectPushAlert(
+            AlertTypeKernelImageSuspicious,
+            HandleToULong(PsGetCurrentProcessId()),
+            inState->BlockingState == DrvDetectBlockingOn ?
+                L"Usermode switched driver blocking state to ON." :
+                L"Usermode switched driver blocking state to OFF.");
         status = STATUS_SUCCESS;
     }
 
@@ -1134,10 +1298,11 @@ DriverEntry(
     RtlZeroMemory(&g_DrvDetect, sizeof(g_DrvDetect));
     KeInitializeSpinLock(&g_DrvDetect.AlertLock);
     KeInitializeSpinLock(&g_DrvDetect.ServiceTrackLock);
+    InterlockedExchange(&g_DrvDetect.BlockingState, DrvDetectBlockingOn);
     DrvDetectPushAlert(
         AlertTypeKernelImageSuspicious,
         0,
-        L"DrvDetect build=trace2-controlset loaded.");
+        L"DrvDetect loaded. Blocking state is ON.");
 
     WDF_DRIVER_CONFIG_INIT(&config, WDF_NO_EVENT_CALLBACK);
     config.DriverInitFlags = WdfDriverInitNonPnpDriver;

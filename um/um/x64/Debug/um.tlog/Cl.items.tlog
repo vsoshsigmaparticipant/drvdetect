@@ -1,1 +1,7 @@
-C:\Users\max\source\repos\drvdetect\um\um\um.cpp;C:\Users\max\source\repos\drvdetect\um\um\x64\Debug\um.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\backends\imgui_impl_dx11.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui_impl_dx11.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\backends\imgui_impl_win32.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui_impl_win32.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\imgui.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\imgui_draw.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui_draw.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\imgui_tables.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui_tables.obj
+C:\Users\max\source\drvdetect\um\um\vendor\imgui\imgui_widgets.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\imgui_widgets.obj
+C:\Users\max\source\drvdetect\um\um\um.cpp;C:\Users\max\source\drvdetect\um\um\x64\Debug\um.obj

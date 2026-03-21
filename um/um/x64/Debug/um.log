@@ -1,0 +1,9 @@
+﻿  imgui_impl_dx11.cpp
+  imgui_impl_win32.cpp
+  imgui.cpp
+  imgui_draw.cpp
+  imgui_tables.cpp
+  imgui_widgets.cpp
+  um.cpp
+  Generating Code...
+  um.vcxproj -> C:\Users\max\source\drvdetect\um\x64\Debug\um.exe

@@ -1,12 +1,6 @@
 ﻿  Building 'km' with toolset 'WindowsKernelModeDriver10.0' and the 'Universal' target platform.
-  Stamping x64\Debug\km.inf
-  Stamping [Version] section with DriverVer=03/10/2026,10.8.25.315
-C:\Users\max\source\repos\drvdetect\km\km\km.inf(41-41): warning 1252: Cannot add service 'km' with StartType=2 and ServiceType=1.
   km.c
-  km.vcxproj -> C:\Users\max\source\repos\drvdetect\km\x64\Debug\km.sys
-  Done Adding Additional Store
-  Successfully signed: C:\Users\max\source\repos\drvdetect\km\x64\Debug\km.sys
-  
+  km.vcxproj -> C:\Users\max\source\drvdetect\km\x64\Debug\km.sys
   Driver is 'Universal'.
   .........................
   Signability test complete.
@@ -18,7 +12,4 @@ C:\Users\max\source\repos\drvdetect\km\km\km.inf(41-41): warning 1252: Cannot ad
   None
   
   Catalog generation complete.
-  C:\Users\max\source\repos\drvdetect\km\x64\Debug\km\km.cat
-  Done Adding Additional Store
-  Successfully signed: C:\Users\max\source\repos\drvdetect\km\x64\Debug\km\km.cat
-  
+  C:\Users\max\source\drvdetect\km\x64\Debug\km\km.cat

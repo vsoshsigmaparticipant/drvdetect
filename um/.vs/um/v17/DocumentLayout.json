@@ -1,9 +1,9 @@
 {
   "Version": 1,
-  "WorkspaceRootPath": "C:\\Users\\max\\source\\repos\\drvdetect\\um\\",
+  "WorkspaceRootPath": "C:\\Users\\max\\source\\drvdetect\\um\\",
   "Documents": [
     {
-      "AbsoluteMoniker": "D:0:0:{33D5AF90-9543-40E9-BFB5-3CECCE4C7699}|um\\um.vcxproj|C:\\Users\\max\\source\\repos\\drvdetect\\um\\um\\um.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "AbsoluteMoniker": "D:0:0:{33D5AF90-9543-40E9-BFB5-3CECCE4C7699}|um\\um.vcxproj|C:\\Users\\max\\source\\drvdetect\\um\\um\\um.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
       "RelativeMoniker": "D:0:0:{33D5AF90-9543-40E9-BFB5-3CECCE4C7699}|um\\um.vcxproj|solutionrelative:um\\um.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
     }
   ],
@@ -20,11 +20,11 @@
               "$type": "Document",
               "DocumentIndex": 0,
               "Title": "um.cpp",
-              "DocumentMoniker": "C:\\Users\\max\\source\\repos\\drvdetect\\um\\um\\um.cpp",
+              "DocumentMoniker": "C:\\Users\\max\\source\\drvdetect\\um\\um\\um.cpp",
               "RelativeDocumentMoniker": "um\\um.cpp",
-              "ToolTip": "C:\\Users\\max\\source\\repos\\drvdetect\\um\\um\\um.cpp",
+              "ToolTip": "C:\\Users\\max\\source\\drvdetect\\um\\um\\um.cpp",
               "RelativeToolTip": "um\\um.cpp",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAABsAAAArAAAAAAAAAA==",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAB8AAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-03-06T16:38:38.783Z",
               "EditorCaption": ""
