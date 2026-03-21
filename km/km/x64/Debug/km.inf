@@ -8,7 +8,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
 CatalogFile = km.cat
-DriverVer = 03/17/2026,21.37.28.915
+DriverVer = 03/21/2026,15.7.14.884
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -24,6 +24,18 @@ km.sys = 1,,
 ; Install Section
 ;*****************************************
 
+[DefaultInstall.NTamd64]
+CopyFiles = File_Copy
+
+[DefaultInstall.NTamd64.Services]
+AddService = DrvDetect,0x00000002, km_Service_Inst
+
+[DefaultUninstall.NTamd64]
+DelFiles = File_Copy
+
+[DefaultUninstall.NTamd64.Services]
+DelService = DrvDetect,0x200
+
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64.10.0...16299 ; %13% support introduced in build 16299
 
@@ -38,7 +50,7 @@ km.sys
 
 ;-------------- Service installation
 [km_Device.NT.Services]
-AddService = km,%SPSVCINST_ASSOCSERVICE%, km_Service_Inst
+AddService = DrvDetect,%SPSVCINST_ASSOCSERVICE%, km_Service_Inst
 
 ; -------------- km driver install sections
 [km_Service_Inst]

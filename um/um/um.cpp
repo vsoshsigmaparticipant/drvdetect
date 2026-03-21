@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwchar>
 #include <deque>
+#include <vector>
 #include <winsvc.h>
 #include <string>
 #include <utility>
@@ -41,9 +42,11 @@ struct AppState
     HANDLE Device = INVALID_HANDLE_VALUE;
     DRVDETECT_STATE DriverState = { DRVDETECT_STATE_VERSION, DrvDetectBlockingOn };
     std::deque<UiAlert> Alerts;
+    std::deque<std::string> InstallerLog;
     InsightState Insight = {};
     std::wstring StatusLine = L"Disconnected";
     ULONGLONG LastConnectTick = 0;
+    ULONGLONG LastInstallAttemptTick = 0;
     ULONGLONG LastStatePollTick = 0;
     bool AutoScroll = true;
     int SelectedAlertVisibleIndex = -1;
@@ -59,6 +62,9 @@ static ImFont* g_BodyFont = nullptr;
 static AppState g_App;
 static const wchar_t* g_ServiceName = L"DrvDetect";
 static constexpr float kPanelPadding = 20.0f;
+
+static std::wstring GetExecutableDirectory();
+static std::wstring JoinPath(const std::wstring& base, const wchar_t* name);
 
 static const wchar_t* AlertTypeToText(unsigned long type)
 {
@@ -90,6 +96,61 @@ static std::string WideToUtf8(const wchar_t* text)
     std::string result(static_cast<size_t>(required), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text, sourceLength, &result[0], required, nullptr, nullptr);
     return result;
+}
+
+static std::wstring Utf8ToWide(const std::string& text)
+{
+    if (text.empty())
+    {
+        return {};
+    }
+
+    const int required = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (required <= 0)
+    {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(required), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &result[0], required);
+    return result;
+}
+
+static void AppendInstallerLog(const std::wstring& message)
+{
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+
+    wchar_t prefix[32] = {};
+    swprintf_s(prefix, L"%02u:%02u:%02u ", now.wHour, now.wMinute, now.wSecond);
+
+    const std::wstring line = prefix + message;
+    g_App.InstallerLog.push_front(WideToUtf8(line.c_str()));
+    while (g_App.InstallerLog.size() > 24)
+    {
+        g_App.InstallerLog.pop_back();
+    }
+
+    const std::wstring logPath = JoinPath(GetExecutableDirectory(), L"drvdetect-bootstrap.log");
+    HANDLE file = CreateFileW(
+        logPath.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    std::string utf8Line = WideToUtf8(line.c_str());
+    utf8Line.append("\r\n");
+    DWORD written = 0;
+    WriteFile(file, utf8Line.data(), static_cast<DWORD>(utf8Line.size()), &written, nullptr);
+    CloseHandle(file);
 }
 
 static std::string FormatTimestamp(const LARGE_INTEGER& timestamp)
@@ -364,6 +425,269 @@ static void DisconnectDevice(const wchar_t* reason)
     g_App.StatusLine = reason;
 }
 
+static std::wstring GetExecutableDirectory()
+{
+    std::vector<wchar_t> buffer(1024, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size())
+    {
+        return {};
+    }
+
+    std::wstring path(buffer.data(), length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return {};
+    }
+
+    return path.substr(0, slash);
+}
+
+static std::wstring JoinPath(const std::wstring& base, const wchar_t* name)
+{
+    if (base.empty())
+    {
+        return {};
+    }
+
+    return base + L"\\" + name;
+}
+
+static bool ServiceBinaryMatches(const wchar_t* currentPath, const wchar_t* expectedPath)
+{
+    if (currentPath == nullptr || expectedPath == nullptr)
+    {
+        return false;
+    }
+
+    return _wcsicmp(currentPath, expectedPath) == 0;
+}
+
+static bool FileExists(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool RunProcessAndWait(const std::wstring& commandLine, DWORD* exitCodeOut = nullptr)
+{
+    STARTUPINFOW startupInfo = {};
+    PROCESS_INFORMATION processInfo = {};
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+
+    mutableCommand.push_back(L'\0');
+    startupInfo.cb = sizeof(startupInfo);
+
+    if (!CreateProcessW(
+            nullptr,
+            mutableCommand.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startupInfo,
+            &processInfo))
+    {
+        AppendInstallerLog(L"CreateProcess failed: " + commandLine);
+        return false;
+    }
+
+    WaitForSingleObject(processInfo.hProcess, INFINITE);
+
+    DWORD exitCode = ERROR_GEN_FAILURE;
+    GetExitCodeProcess(processInfo.hProcess, &exitCode);
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    if (exitCodeOut != nullptr)
+    {
+        *exitCodeOut = exitCode;
+    }
+
+    wchar_t result[192] = {};
+    swprintf_s(result, L"Process exit %lu: %ls", exitCode, commandLine.c_str());
+    AppendInstallerLog(result);
+    return exitCode == 0;
+}
+
+static bool EnsureDriverInstalledAndRunning()
+{
+    const ULONGLONG now = GetTickCount64();
+    if ((now - g_App.LastInstallAttemptTick) < 3000)
+    {
+        return false;
+    }
+
+    g_App.LastInstallAttemptTick = now;
+
+    const std::wstring baseDir = GetExecutableDirectory();
+    const std::wstring infPath = JoinPath(baseDir, L"km.inf");
+    const std::wstring sysPath = JoinPath(baseDir, L"km.sys");
+    const std::wstring certPath = JoinPath(baseDir, L"DrvDetectTest.cer");
+
+    if (!FileExists(infPath) || !FileExists(sysPath))
+    {
+        g_App.StatusLine = L"Driver files were not found next to um.exe";
+        AppendInstallerLog(g_App.StatusLine);
+        return false;
+    }
+
+    AppendInstallerLog(L"Bootstrap started");
+    AppendInstallerLog(L"Bundle directory: " + baseDir);
+
+    if (FileExists(certPath))
+    {
+        AppendInstallerLog(L"Importing test certificate");
+        RunProcessAndWait(L"certutil -addstore -f Root \"" + certPath + L"\"");
+        RunProcessAndWait(L"certutil -addstore -f TrustedPublisher \"" + certPath + L"\"");
+    }
+    else
+    {
+        AppendInstallerLog(L"Certificate file not found, skipping import");
+    }
+
+    DWORD pnputilExitCode = ERROR_GEN_FAILURE;
+    const bool packageAdded =
+        RunProcessAndWait(L"pnputil /add-driver \"" + infPath + L"\" /install", &pnputilExitCode);
+    {
+        wchar_t message[160] = {};
+        swprintf_s(message, L"pnputil result=%lu", pnputilExitCode);
+        AppendInstallerLog(message);
+    }
+
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (manager == nullptr)
+    {
+        g_App.StatusLine = L"OpenSCManager failed";
+        AppendInstallerLog(g_App.StatusLine);
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(
+        manager,
+        g_ServiceName,
+        SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_CHANGE_CONFIG);
+
+    const wchar_t* installedBinaryPath = sysPath.c_str();
+
+    if (service == nullptr)
+    {
+        AppendInstallerLog(L"Service not found, creating DrvDetect");
+        service = CreateServiceW(
+            manager,
+            g_ServiceName,
+            g_ServiceName,
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_CHANGE_CONFIG,
+            SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            installedBinaryPath,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr);
+
+        if (service == nullptr)
+        {
+            CloseServiceHandle(manager);
+            g_App.StatusLine = L"Driver service could not be created";
+            AppendInstallerLog(g_App.StatusLine);
+            return false;
+        }
+    }
+    else
+    {
+        AppendInstallerLog(L"Opened existing DrvDetect service");
+    }
+
+    DWORD bytesNeeded = 0;
+    QueryServiceConfigW(service, nullptr, 0, &bytesNeeded);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && bytesNeeded >= sizeof(QUERY_SERVICE_CONFIGW))
+    {
+        std::vector<BYTE> configBuffer(bytesNeeded);
+        auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(configBuffer.data());
+        if (QueryServiceConfigW(service, config, bytesNeeded, &bytesNeeded) &&
+            !ServiceBinaryMatches(config->lpBinaryPathName, installedBinaryPath) &&
+            !ChangeServiceConfigW(
+                service,
+                SERVICE_NO_CHANGE,
+                SERVICE_DEMAND_START,
+                SERVICE_NO_CHANGE,
+                installedBinaryPath,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                g_ServiceName))
+        {
+            g_App.StatusLine = L"Driver service path update failed";
+            AppendInstallerLog(g_App.StatusLine);
+        }
+        else if (QueryServiceConfigW(service, config, bytesNeeded, &bytesNeeded))
+        {
+            AppendInstallerLog(L"Service binary path checked: " + std::wstring(installedBinaryPath));
+        }
+    }
+
+    SERVICE_STATUS status = {};
+    bool started = false;
+    if (QueryServiceStatus(service, &status))
+    {
+        wchar_t currentState[96] = {};
+        swprintf_s(currentState, L"Service state before start=%lu", status.dwCurrentState);
+        AppendInstallerLog(currentState);
+        if (status.dwCurrentState == SERVICE_RUNNING)
+        {
+            started = true;
+        }
+        else
+        {
+            const BOOL startIssued = StartServiceW(service, 0, nullptr);
+            const DWORD startError = startIssued ? ERROR_SUCCESS : GetLastError();
+            Sleep(700);
+            if (QueryServiceStatus(service, &status))
+            {
+                started = status.dwCurrentState == SERVICE_RUNNING;
+            }
+            if (!started && !startIssued)
+            {
+                wchar_t buffer[160] = {};
+                swprintf_s(buffer, L"Driver start failed: GLE=%lu", startError);
+                g_App.StatusLine = buffer;
+                AppendInstallerLog(g_App.StatusLine);
+            }
+        }
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+
+    if (!started)
+    {
+        if (g_App.StatusLine.empty() || g_App.StatusLine == L"Disconnected")
+        {
+            wchar_t buffer[192] = {};
+            swprintf_s(
+                buffer,
+                L"Driver service is not running (pnputil=%lu)",
+                pnputilExitCode);
+            g_App.StatusLine = buffer;
+        }
+        AppendInstallerLog(g_App.StatusLine);
+    }
+    else if (packageAdded)
+    {
+        g_App.StatusLine = L"Driver package installed";
+        AppendInstallerLog(L"Driver service is running");
+    }
+
+    return started;
+}
+
 static bool EnsureDeviceConnection()
 {
     const ULONGLONG now = GetTickCount64();
@@ -379,28 +703,7 @@ static bool EnsureDeviceConnection()
     }
 
     g_App.LastConnectTick = now;
-    {
-        SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-        if (manager != nullptr)
-        {
-            SC_HANDLE service = OpenServiceW(manager, g_ServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
-            if (service != nullptr)
-            {
-                SERVICE_STATUS status = {};
-                if (QueryServiceStatus(service, &status))
-                {
-                    if (status.dwCurrentState != SERVICE_RUNNING && status.dwCurrentState != SERVICE_START_PENDING)
-                    {
-                        StartServiceW(service, 0, nullptr);
-                    }
-                }
-
-                CloseServiceHandle(service);
-            }
-
-            CloseServiceHandle(manager);
-        }
-    }
+    EnsureDriverInstalledAndRunning();
 
     g_App.Device = CreateFileW(
         DRVDETECT_USER_SYMLINK,
@@ -416,10 +719,12 @@ static bool EnsureDeviceConnection()
         wchar_t buffer[96] = {};
         swprintf_s(buffer, L"Device open failed: GLE=%lu", GetLastError());
         g_App.StatusLine = buffer;
+        AppendInstallerLog(g_App.StatusLine);
         return false;
     }
 
     g_App.StatusLine = L"Connected";
+    AppendInstallerLog(L"Device handle opened successfully");
     g_App.LastStatePollTick = 0;
     return true;
 }
@@ -928,6 +1233,23 @@ static void RenderSidebar()
         EnsureDeviceConnection();
         QueryDriverState(false);
     }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Installer log");
+    ImGui::BeginChild("installer_log", ImVec2(0.0f, 220.0f), false, ImGuiWindowFlags_NoScrollbar);
+    if (g_App.InstallerLog.empty())
+    {
+        ImGui::TextDisabled("No bootstrap activity yet.");
+    }
+    else
+    {
+        for (const std::string& line : g_App.InstallerLog)
+        {
+            ImGui::TextWrapped("%s", line.c_str());
+        }
+    }
+    ImGui::EndChild();
     EndPanelInset();
     ImGui::EndChild();
     ImGui::PopStyleColor();

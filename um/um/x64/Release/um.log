@@ -1,7 +1,13 @@
-﻿  um.cpp
+﻿  imgui_impl_dx11.cpp
+  imgui_impl_win32.cpp
+  imgui.cpp
+  imgui_draw.cpp
+  imgui_tables.cpp
+  imgui_widgets.cpp
+  um.cpp
   Generating code
-  3 of 1932 functions ( 0.2%) were compiled, the rest were copied from previous compilation.
+  0 of 2087 functions ( 0.0%) were compiled, the rest were copied from previous compilation.
     0 functions were new in current compilation
-    34 functions had inline decision re-evaluated but remain unchanged
+    0 functions had inline decision re-evaluated but remain unchanged
   Finished generating code
   um.vcxproj -> C:\Users\max\source\drvdetect\um\x64\Release\um.exe
