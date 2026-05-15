@@ -1,12 +1,37 @@
 {
   "Version": 1,
-  "WorkspaceRootPath": "C:\\Users\\max\\source\\drvdetect\\km\\",
-  "Documents": [],
+  "WorkspaceRootPath": "C:\\Users\\max\\source\\repos\\drvdetect\\km\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{9672A593-2627-B990-DF1E-6F6FC5A359F7}|km\\km.vcxproj|C:\\Users\\max\\source\\repos\\drvdetect\\km\\km\\km.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{9672A593-2627-B990-DF1E-6F6FC5A359F7}|km\\km.vcxproj|solutionrelative:km\\km.c||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    }
+  ],
   "DocumentGroupContainers": [
     {
       "Orientation": 0,
       "VerticalTabListWidth": 256,
-      "DocumentGroups": []
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "km.c",
+              "DocumentMoniker": "C:\\Users\\max\\source\\repos\\drvdetect\\km\\km\\km.c",
+              "RelativeDocumentMoniker": "km\\km.c",
+              "ToolTip": "C:\\Users\\max\\source\\repos\\drvdetect\\km\\km\\km.c",
+              "RelativeToolTip": "km\\km.c",
+              "ViewState": "AgIAAEIAAAAAAAAAAAAAAAUAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000423|",
+              "WhenOpened": "2026-03-25T13:58:10.132Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
     }
   ]
 }

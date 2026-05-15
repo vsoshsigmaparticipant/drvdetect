@@ -1,10 +1,15 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "framework.h"
 #include "shared.h"
 
 #include <d3d11.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cwchar>
 #include <deque>
+#include <shellapi.h>
 #include <vector>
 #include <winsvc.h>
 #include <string>
@@ -16,6 +21,8 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Ws2_32.lib")
 
 struct UiAlert
 {
@@ -62,9 +69,599 @@ static ImFont* g_BodyFont = nullptr;
 static AppState g_App;
 static const wchar_t* g_ServiceName = L"DrvDetect";
 static constexpr float kPanelPadding = 20.0f;
+static bool g_WebShutdownRequested = false;
+static constexpr unsigned short kDefaultWebPort = 8080;
+static unsigned short g_WebPort = kDefaultWebPort;
 
 static std::wstring GetExecutableDirectory();
 static std::wstring JoinPath(const std::wstring& base, const wchar_t* name);
+static std::string WideToUtf8(const wchar_t* text);
+static void AppendInstallerLog(const std::wstring& message);
+static void DisconnectDevice(const wchar_t* reason);
+static bool QueryDriverState(bool updateStatusOnError);
+static bool SetBlockingState(unsigned long blockingState);
+static void PumpDriver();
+static int CountThreatAlerts();
+static const char* GetAlertKindLabel(const UiAlert& alert);
+
+static bool TryParsePort(const wchar_t* text, unsigned short* portOut)
+{
+    if (text == nullptr || *text == L'\0' || portOut == nullptr)
+    {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(text, &end, 10);
+    if (end == text || *end != L'\0' || value == 0 || value > 65535)
+    {
+        return false;
+    }
+
+    *portOut = static_cast<unsigned short>(value);
+    return true;
+}
+
+static bool TryGetWebModePort(PWSTR commandLine, unsigned short* portOut)
+{
+    UNREFERENCED_PARAMETER(commandLine);
+
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv == nullptr)
+    {
+        return false;
+    }
+
+    bool webMode = false;
+    unsigned short selectedPort = kDefaultWebPort;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        const wchar_t* argument = argv[i];
+        if (_wcsicmp(argument, L"--web") == 0)
+        {
+            webMode = true;
+            continue;
+        }
+
+        if (_wcsicmp(argument, L"--browser") == 0)
+        {
+            webMode = true;
+            continue;
+        }
+
+        if (_wcsnicmp(argument, L"--port=", 7) == 0)
+        {
+            unsigned short parsedPort = 0;
+            if (TryParsePort(argument + 7, &parsedPort))
+            {
+                selectedPort = parsedPort;
+            }
+            continue;
+        }
+
+        if (_wcsicmp(argument, L"--port") == 0 && (i + 1) < argc)
+        {
+            unsigned short parsedPort = 0;
+            if (TryParsePort(argv[i + 1], &parsedPort))
+            {
+                selectedPort = parsedPort;
+            }
+            ++i;
+        }
+    }
+
+    LocalFree(argv);
+
+    if (!webMode || portOut == nullptr)
+    {
+        return webMode;
+    }
+
+    *portOut = selectedPort;
+    return true;
+}
+
+static std::string JsonEscape(const std::string& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size() + 16);
+
+    for (unsigned char ch : value)
+    {
+        switch (ch)
+        {
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '\b':
+            escaped += "\\b";
+            break;
+        case '\f':
+            escaped += "\\f";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            if (ch < 0x20)
+            {
+                char buffer[7] = {};
+                sprintf_s(buffer, "\\u%04x", ch);
+                escaped += buffer;
+            }
+            else
+            {
+                escaped.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+
+    return escaped;
+}
+
+static void AppendJsonString(std::string& output, const std::string& value)
+{
+    output.push_back('"');
+    output += JsonEscape(value);
+    output.push_back('"');
+}
+
+static void AppendJsonBool(std::string& output, bool value)
+{
+    output += value ? "true" : "false";
+}
+
+static std::string BuildAlertJson(const UiAlert& alert)
+{
+    std::string json;
+    json.reserve(512);
+    json += "{";
+    json += "\"time\":";
+    AppendJsonString(json, alert.TimeText);
+    json += ",\"type\":";
+    AppendJsonString(json, alert.TypeText);
+    json += ",\"processId\":" + std::to_string(alert.ProcessId);
+    json += ",\"message\":";
+    AppendJsonString(json, alert.Message);
+    json += ",\"summary\":";
+    AppendJsonString(json, alert.Summary);
+    json += ",\"processPath\":";
+    AppendJsonString(json, alert.ProcessPath);
+    json += ",\"driverPath\":";
+    AppendJsonString(json, alert.DriverPath);
+    json += ",\"registryPath\":";
+    AppendJsonString(json, alert.RegistryPath);
+    json += ",\"value\":";
+    AppendJsonString(json, alert.ValueText);
+    json += ",\"blocked\":";
+    AppendJsonBool(json, alert.Blocked);
+    json += ",\"kind\":";
+    AppendJsonString(json, GetAlertKindLabel(alert));
+    json += "}";
+    return json;
+}
+
+static std::string BuildStateJson()
+{
+    std::string json;
+    json += "{";
+    json += "\"connected\":";
+    AppendJsonBool(json, g_App.Device != INVALID_HANDLE_VALUE);
+    json += ",\"status\":";
+    AppendJsonString(json, WideToUtf8(g_App.StatusLine.c_str()));
+    json += ",\"blockingEnabled\":";
+    AppendJsonBool(json, g_App.DriverState.BlockingState == DrvDetectBlockingOn);
+    json += ",\"pendingAlerts\":" + std::to_string(g_App.DriverState.PendingAlerts);
+    json += ",\"threatCount\":" + std::to_string(CountThreatAlerts());
+    json += ",\"hasThreat\":";
+    AppendJsonBool(json, g_App.Insight.HasThreat);
+    json += ",\"lastThreatBlocked\":";
+    AppendJsonBool(json, g_App.Insight.LastThreatBlocked);
+    json += "}";
+    return json;
+}
+
+static std::string BuildAlertsJson()
+{
+    std::string json = "[";
+    bool first = true;
+    for (const UiAlert& alert : g_App.Alerts)
+    {
+        if (!first)
+        {
+            json += ",";
+        }
+
+        first = false;
+        json += BuildAlertJson(alert);
+    }
+
+    json += "]";
+    return json;
+}
+
+static std::string BuildSnapshotJson()
+{
+    std::string json = BuildStateJson();
+    json.pop_back();
+    json += ",\"alerts\":";
+    json += BuildAlertsJson();
+    json += ",\"installerLog\":[";
+
+    bool first = true;
+    for (const std::string& line : g_App.InstallerLog)
+    {
+        if (!first)
+        {
+            json += ",";
+        }
+
+        first = false;
+        AppendJsonString(json, line);
+    }
+
+    json += "]}";
+    return json;
+}
+
+static bool SendAll(SOCKET socketHandle, const char* data, int length)
+{
+    int sent = 0;
+    while (sent < length)
+    {
+        const int chunk = send(socketHandle, data + sent, length - sent, 0);
+        if (chunk == SOCKET_ERROR)
+        {
+            return false;
+        }
+
+        sent += chunk;
+    }
+
+    return true;
+}
+
+static void SendHttpResponse(SOCKET socketHandle, const char* status, const char* contentType, const std::string& body)
+{
+    std::string headers = "HTTP/1.1 ";
+    headers += status;
+    headers += "\r\nContent-Type: ";
+    headers += contentType;
+    headers += "\r\nContent-Length: ";
+    headers += std::to_string(body.size());
+    headers += "\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+
+    SendAll(socketHandle, headers.c_str(), static_cast<int>(headers.size()));
+    SendAll(socketHandle, body.c_str(), static_cast<int>(body.size()));
+}
+
+static std::string GetQueryValue(const std::string& query, const char* key)
+{
+    const std::string prefix = std::string(key) + "=";
+    size_t searchStart = 0;
+    while (searchStart < query.size())
+    {
+        const size_t end = query.find('&', searchStart);
+        const std::string part = query.substr(searchStart, end == std::string::npos ? std::string::npos : end - searchStart);
+        if (part.compare(0, prefix.size(), prefix) == 0)
+        {
+            return part.substr(prefix.size());
+        }
+
+        if (end == std::string::npos)
+        {
+            break;
+        }
+
+        searchStart = end + 1;
+    }
+
+    return {};
+}
+
+static std::string BuildWebPage(unsigned short port)
+{
+    std::string page = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrvDetect Web Console</title>
+<style>
+:root{color-scheme:dark;font-family:Segoe UI,Arial,sans-serif;background:#070b12;color:#edf2ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#15233a 0,#070b12 52%,#04060a 100%)}
+.shell{max-width:1400px;margin:0 auto;padding:24px}.hero{display:grid;gap:16px;grid-template-columns:2fr 1fr;align-items:stretch}
+.panel{background:rgba(15,21,34,.88);border:1px solid rgba(123,154,255,.12);border-radius:24px;padding:20px;box-shadow:0 18px 60px rgba(0,0,0,.28)}
+.title{font-size:14px;text-transform:uppercase;letter-spacing:.16em;color:#8ca0d7;margin-bottom:10px}.headline{font-size:36px;font-weight:700;margin:0 0 8px}
+.sub{color:#b5c0dd;line-height:1.5}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-top:16px}
+.stat{padding:16px;border-radius:18px;background:#101827;border:1px solid rgba(255,255,255,.05)}.stat strong{display:block;font-size:26px;margin-top:8px}
+.status{display:flex;align-items:center;gap:10px;font-size:14px;color:#b7c3e4}.dot{width:12px;height:12px;border-radius:50%;background:#e46d51;box-shadow:0 0 18px rgba(228,109,81,.65)}
+.dot.ok{background:#34d399;box-shadow:0 0 18px rgba(52,211,153,.65)}.controls{display:flex;flex-wrap:wrap;gap:12px;margin-top:18px}
+button{border:0;border-radius:999px;padding:12px 18px;font-weight:700;cursor:pointer;color:#06111f;background:linear-gradient(135deg,#79f2c0,#34d399)}
+button.alt{background:linear-gradient(135deg,#ffd67d,#f59e0b)}button.stop{background:linear-gradient(135deg,#ff8a8a,#ef4444);color:#fff}
+.layout{display:grid;grid-template-columns:1.4fr .8fr;gap:16px;margin-top:16px}.list{display:grid;gap:12px;max-height:70vh;overflow:auto;padding-right:4px}
+.alert{padding:16px;border-radius:20px;background:#0f1725;border:1px solid rgba(255,255,255,.05)}.alert.blocked{border-color:rgba(52,211,153,.35)}.alert.detected{border-color:rgba(245,158,11,.35)}
+.meta{display:flex;gap:12px;flex-wrap:wrap;color:#8ea0cc;font-size:13px;margin-bottom:8px}.summary{font-size:20px;font-weight:700;margin-bottom:8px}.path{word-break:break-word;color:#d4def7}
+.pill{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.pill.blocked{background:rgba(52,211,153,.16);color:#7bf0c0}.pill.detected{background:rgba(245,158,11,.16);color:#ffd07a}.stack{display:grid;gap:10px}
+.logline{font-family:Consolas,monospace;font-size:13px;color:#c7d4f7;background:#0e1521;padding:10px 12px;border-radius:14px}.empty{color:#8ea0cc;padding:18px;border:1px dashed rgba(255,255,255,.1);border-radius:18px}
+@media (max-width:980px){.hero,.layout,.stats{grid-template-columns:1fr}.headline{font-size:30px}.shell{padding:16px}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="hero">
+    <section class="panel">
+      <div class="title">DrvDetect</div>
+      <h1 class="headline">Browser dashboard for the usermode monitor</h1>
+      <div class="sub">This page talks to the local DrvDetect usermode process on <strong>127.0.0.1:)HTML";
+    page += std::to_string(port);
+    page += R"HTML(</strong> and shows live state, alerts, and bootstrap logs.</div>
+      <div class="stats">
+        <div class="stat"><div>Threat alerts</div><strong id="threatCount">0</strong></div>
+        <div class="stat"><div>Pending in driver</div><strong id="pendingAlerts">0</strong></div>
+        <div class="stat"><div>Blocking mode</div><strong id="blockingState">Off</strong></div>
+        <div class="stat"><div>Last verdict</div><strong id="lastVerdict">None</strong></div>
+      </div>
+      <div class="controls">
+        <button id="enableBtn">Enable blocking</button>
+        <button id="disableBtn" class="alt">Disable blocking</button>
+        <button id="refreshBtn" class="alt">Refresh now</button>
+        <button id="shutdownBtn" class="stop">Stop web mode</button>
+      </div>
+    </section>
+    <aside class="panel">
+      <div class="title">Connection</div>
+      <div class="status"><span id="statusDot" class="dot"></span><span id="statusLine">Starting...</span></div>
+      <div class="sub" style="margin-top:14px">The web UI is read-only except for blocking toggles and server shutdown. The driver/device path stays in the native usermode process.</div>
+    </aside>
+  </div>
+  <div class="layout">
+    <section class="panel">
+      <div class="title">Alerts</div>
+      <div id="alerts" class="list"></div>
+    </section>
+    <aside class="panel">
+      <div class="title">Bootstrap Log</div>
+      <div id="log" class="stack"></div>
+    </aside>
+  </div>
+</div>
+<script>
+const els={
+  threatCount:document.getElementById('threatCount'),pendingAlerts:document.getElementById('pendingAlerts'),blockingState:document.getElementById('blockingState'),
+  lastVerdict:document.getElementById('lastVerdict'),statusDot:document.getElementById('statusDot'),statusLine:document.getElementById('statusLine'),
+  alerts:document.getElementById('alerts'),log:document.getElementById('log')
+};
+function esc(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function renderAlerts(alerts){
+  if(!alerts.length){els.alerts.innerHTML='<div class="empty">No alerts yet.</div>';return;}
+  els.alerts.innerHTML=alerts.map(alert=>{
+    const verdict=alert.blocked?'THREAT BLOCKED':'THREAT DETECTED';
+    const cardClass=alert.blocked?'blocked':'detected';
+    const detail=alert.processPath||alert.driverPath||alert.registryPath||alert.message;
+    return `<article class="alert ${cardClass}"><div class="meta"><span>${esc(alert.time)}</span><span>${esc(alert.type)}</span><span>PID ${esc(alert.processId)}</span><span class="pill ${cardClass}">${verdict}</span></div><div class="summary">${esc(alert.summary||alert.type)}</div><div class="path">${esc(detail)}</div><div class="sub" style="margin-top:10px">${esc(alert.message)}</div></article>`;
+  }).join('');
+}
+function renderLog(lines){
+  if(!lines.length){els.log.innerHTML='<div class="empty">No bootstrap activity logged yet.</div>';return;}
+  els.log.innerHTML=lines.map(line=>`<div class="logline">${esc(line)}</div>`).join('');
+}
+function render(snapshot){
+  els.threatCount.textContent=snapshot.threatCount;
+  els.pendingAlerts.textContent=snapshot.pendingAlerts;
+  els.blockingState.textContent=snapshot.blockingEnabled?'On':'Off';
+  els.lastVerdict.textContent=snapshot.hasThreat?(snapshot.lastThreatBlocked?'Blocked':'Detected'):'None';
+  els.statusLine.textContent=snapshot.status;
+  els.statusDot.className='dot'+(snapshot.connected?' ok':'');
+  renderAlerts(snapshot.alerts||[]);
+  renderLog(snapshot.installerLog||[]);
+}
+async function refresh(){
+  try{
+    const response=await fetch('/api/snapshot',{cache:'no-store'});
+    render(await response.json());
+  }catch(error){
+    els.statusLine.textContent='Web UI lost contact with the local process';
+    els.statusDot.className='dot';
+  }
+}
+async function setBlocking(enabled){
+  await fetch(`/api/blocking?enabled=${enabled?1:0}`,{method:'POST'});
+  await refresh();
+}
+document.getElementById('enableBtn').addEventListener('click',()=>setBlocking(true));
+document.getElementById('disableBtn').addEventListener('click',()=>setBlocking(false));
+document.getElementById('refreshBtn').addEventListener('click',refresh);
+document.getElementById('shutdownBtn').addEventListener('click',async()=>{
+  if(!confirm('Stop the DrvDetect web server?')){return;}
+  await fetch('/api/shutdown',{method:'POST'});
+  els.statusLine.textContent='Shutdown requested';
+});
+refresh();
+setInterval(refresh,1000);
+</script>
+</body>
+</html>)HTML";
+    return page;
+}
+
+static void HandleHttpRequest(SOCKET clientSocket)
+{
+    char buffer[16384] = {};
+    const int received = recv(clientSocket, buffer, static_cast<int>(sizeof(buffer) - 1), 0);
+    if (received <= 0)
+    {
+        return;
+    }
+
+    buffer[received] = '\0';
+    std::string request(buffer, received);
+    const size_t lineEnd = request.find("\r\n");
+    if (lineEnd == std::string::npos)
+    {
+        SendHttpResponse(clientSocket, "400 Bad Request", "text/plain; charset=utf-8", "Malformed request");
+        return;
+    }
+
+    const std::string requestLine = request.substr(0, lineEnd);
+    const size_t firstSpace = requestLine.find(' ');
+    const size_t secondSpace = requestLine.find(' ', firstSpace == std::string::npos ? firstSpace : firstSpace + 1);
+    if (firstSpace == std::string::npos || secondSpace == std::string::npos)
+    {
+        SendHttpResponse(clientSocket, "400 Bad Request", "text/plain; charset=utf-8", "Malformed request line");
+        return;
+    }
+
+    const std::string method = requestLine.substr(0, firstSpace);
+    const std::string target = requestLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+    const size_t queryPos = target.find('?');
+    const std::string path = queryPos == std::string::npos ? target : target.substr(0, queryPos);
+    const std::string query = queryPos == std::string::npos ? std::string() : target.substr(queryPos + 1);
+
+    PumpDriver();
+
+    if (method == "GET" && path == "/")
+    {
+        SendHttpResponse(clientSocket, "200 OK", "text/html; charset=utf-8", BuildWebPage(g_WebPort));
+        return;
+    }
+
+    if (method == "GET" && path == "/favicon.ico")
+    {
+        SendHttpResponse(clientSocket, "204 No Content", "text/plain; charset=utf-8", "");
+        return;
+    }
+
+    if (method == "GET" && path == "/api/state")
+    {
+        SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", BuildStateJson());
+        return;
+    }
+
+    if (method == "GET" && path == "/api/alerts")
+    {
+        SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", BuildAlertsJson());
+        return;
+    }
+
+    if (method == "GET" && path == "/api/snapshot")
+    {
+        SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", BuildSnapshotJson());
+        return;
+    }
+
+    if (method == "POST" && path == "/api/blocking")
+    {
+        const std::string enabledValue = GetQueryValue(query, "enabled");
+        const unsigned long blockingState = enabledValue == "1" || enabledValue == "true" ? DrvDetectBlockingOn : DrvDetectBlockingOff;
+        if (!SetBlockingState(blockingState))
+        {
+            SendHttpResponse(clientSocket, "503 Service Unavailable", "application/json; charset=utf-8", BuildStateJson());
+            return;
+        }
+
+        QueryDriverState(false);
+        SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", BuildStateJson());
+        return;
+    }
+
+    if (method == "POST" && path == "/api/shutdown")
+    {
+        g_WebShutdownRequested = true;
+        SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        return;
+    }
+
+    SendHttpResponse(clientSocket, "404 Not Found", "text/plain; charset=utf-8", "Not found");
+}
+
+static int RunWebServer(unsigned short port)
+{
+    g_WebPort = port;
+
+    WSADATA wsaData = {};
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        MessageBoxW(nullptr, L"WSAStartup failed.", L"DrvDetect", MB_ICONERROR | MB_OK);
+        return 1;
+    }
+
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET)
+    {
+        WSACleanup();
+        MessageBoxW(nullptr, L"Could not create the web server socket.", L"DrvDetect", MB_ICONERROR | MB_OK);
+        return 1;
+    }
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(listenSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
+        listen(listenSocket, SOMAXCONN) == SOCKET_ERROR)
+    {
+        closesocket(listenSocket);
+        WSACleanup();
+        MessageBoxW(nullptr, L"Could not bind the web server to 127.0.0.1.", L"DrvDetect", MB_ICONERROR | MB_OK);
+        return 1;
+    }
+
+    u_long nonBlocking = 1;
+    ioctlsocket(listenSocket, FIONBIO, &nonBlocking);
+
+    wchar_t urlBuffer[128] = {};
+    swprintf_s(urlBuffer, L"http://127.0.0.1:%u/", port);
+    g_App.StatusLine = L"Web dashboard ready";
+    AppendInstallerLog(L"Web dashboard listening on " + std::wstring(urlBuffer));
+    ShellExecuteW(nullptr, L"open", urlBuffer, nullptr, nullptr, SW_SHOWNORMAL);
+
+    g_WebShutdownRequested = false;
+    while (!g_WebShutdownRequested)
+    {
+        PumpDriver();
+
+        fd_set readSet = {};
+        FD_ZERO(&readSet);
+        FD_SET(listenSocket, &readSet);
+
+        TIMEVAL timeout = {};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+
+        const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+        if (ready > 0 && FD_ISSET(listenSocket, &readSet))
+        {
+            SOCKET clientSocket = accept(listenSocket, nullptr, nullptr);
+            if (clientSocket != INVALID_SOCKET)
+            {
+                u_long clientBlocking = 0;
+                ioctlsocket(clientSocket, FIONBIO, &clientBlocking);
+                HandleHttpRequest(clientSocket);
+                closesocket(clientSocket);
+            }
+        }
+    }
+
+    DisconnectDevice(L"Web mode stopped");
+    closesocket(listenSocket);
+    WSACleanup();
+    return 0;
+}
 
 static const wchar_t* AlertTypeToText(unsigned long type)
 {
@@ -1410,6 +2007,12 @@ static void RenderUi()
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    unsigned short webPort = 0;
+    if (TryGetWebModePort(GetCommandLineW(), &webPort))
+    {
+        return RunWebServer(webPort == 0 ? kDefaultWebPort : webPort);
+    }
+
     WNDCLASSEXW windowClass = {
         sizeof(windowClass), CS_CLASSDC, WindowProc, 0L, 0L, instance, nullptr, nullptr, nullptr, nullptr, L"DrvDetectGui", nullptr
     };
