@@ -17,6 +17,7 @@ typedef struct _DRVDETECT_GLOBALS
 {
     WDFDEVICE ControlDevice;
     volatile LONG BlockingState;
+    volatile LONG LockState;
     BOOLEAN ProcessNotifyRegistered;
     BOOLEAN ProcessNotifyLegacyRegistered;
     BOOLEAN ImageNotifyRegistered;
@@ -28,6 +29,7 @@ typedef struct _DRVDETECT_GLOBALS
     ULONG AlertTail;
     ULONG AlertCount;
     DRVDETECT_ALERT Alerts[DRVDETECT_MAX_ALERTS];
+    HANDLE AuthorizedProcessId;
 } DRVDETECT_GLOBALS;
 
 static DRVDETECT_GLOBALS g_DrvDetect;
@@ -37,6 +39,7 @@ typedef struct _DRVDETECT_SERVICE_TRACK
     BOOLEAN InUse;
     BOOLEAN HasKernelType;
     BOOLEAN HasSuspiciousImagePath;
+    LARGE_INTEGER LastAccessTime;
     WCHAR KeyName[160];
     WCHAR ImagePath[160];
 } DRVDETECT_SERVICE_TRACK;
@@ -324,10 +327,8 @@ DrvDetectIsLikelyKdmapperImagePath(
     USHORT baseLen;
     BOOLEAN hasDot = FALSE;
     BOOLEAN hasSysExtension = FALSE;
-    BOOLEAN tempLikePath = FALSE;
-    BOOLEAN hasUserTemp = FALSE;
-    BOOLEAN hasWindowsTemp = FALSE;
-    BOOLEAN allAsciiName = TRUE;
+    BOOLEAN suspiciousPath = FALSE;
+    BOOLEAN isStandardDriverPath = FALSE;
 
     if (ValueData == NULL || ValueData->Buffer == NULL || ValueData->Length == 0)
     {
@@ -339,13 +340,11 @@ DrvDetectIsLikelyKdmapperImagePath(
         return FALSE;
     }
 
-    hasUserTemp =
-        DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
-        DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\");
-    hasWindowsTemp = DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\");
-    tempLikePath = hasUserTemp || hasWindowsTemp;
+    isStandardDriverPath =
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\system32\\drivers\\") ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\system32\\driverstore\\");
 
-    if (DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\system32\\drivers\\"))
+    if (isStandardDriverPath)
     {
         return FALSE;
     }
@@ -355,7 +354,16 @@ DrvDetectIsLikelyKdmapperImagePath(
         return TRUE;
     }
 
-    if (!tempLikePath)
+    suspiciousPath =
+        (DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
+         DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\")) ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\") ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\programdata\\") ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\") ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\downloads\\") ||
+        DrvDetectContainsSubstrInsensitive(ValueData, L"\\desktop\\");
+
+    if (!suspiciousPath)
     {
         return FALSE;
     }
@@ -376,9 +384,9 @@ DrvDetectIsLikelyKdmapperImagePath(
     }
 
     baseLen = end - baseStart;
-    if (baseLen < 8 || baseLen > 44)
+    if (baseLen < 4 || baseLen > 80)
     {
-        return FALSE;
+        return TRUE;
     }
 
     for (i = baseStart; i < end; i++)
@@ -395,24 +403,13 @@ DrvDetectIsLikelyKdmapperImagePath(
                 hasSysExtension = TRUE;
                 break;
             }
-
-            allAsciiName = FALSE;
             break;
         }
 
-        if (!((c >= L'0' && c <= L'9') ||
-              (c >= L'a' && c <= L'z') ||
-              (c >= L'A' && c <= L'Z') ||
-              c == L'_'))
+        if (c > 0x7F)
         {
-            allAsciiName = FALSE;
-            break;
+            return TRUE;
         }
-    }
-
-    if (!allAsciiName)
-    {
-        return FALSE;
     }
 
     if (!hasDot)
@@ -439,7 +436,12 @@ DrvDetectShouldBlockDriverServiceImagePath(
     if (DrvDetectContainsSubstrInsensitive(ValueData, L"\\??\\") &&
         ((DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
           DrvDetectContainsSubstrInsensitive(ValueData, L"\\appdata\\local\\temp\\")) ||
-         DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\")))
+         DrvDetectContainsSubstrInsensitive(ValueData, L"\\windows\\temp\\") ||
+         DrvDetectContainsSubstrInsensitive(ValueData, L"\\programdata\\") ||
+         (DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
+          DrvDetectContainsSubstrInsensitive(ValueData, L"\\downloads\\")) ||
+         (DrvDetectContainsSubstrInsensitive(ValueData, L"\\users\\") &&
+          DrvDetectContainsSubstrInsensitive(ValueData, L"\\desktop\\"))))
     {
         return TRUE;
     }
@@ -510,7 +512,7 @@ DrvDetectDescribeRegistryWrite(
 }
 
 static
-VOID
+BOOLEAN
 DrvDetectInitRegistryStringValue(
     _Out_ PUNICODE_STRING ValueData,
     _In_reads_bytes_(DataSize) PVOID Data,
@@ -520,7 +522,15 @@ DrvDetectInitRegistryStringValue(
     USHORT lengthBytes;
 
     ValueData->Buffer = (PWCH)Data;
-    lengthBytes = (USHORT)min(DataSize, (ULONG)0xFFFE);
+
+    if (DataSize > (ULONG)0xFFFE)
+    {
+        ValueData->Length = 0;
+        ValueData->MaximumLength = 0;
+        return FALSE;
+    }
+
+    lengthBytes = (USHORT)DataSize;
 
     while (lengthBytes >= sizeof(WCHAR))
     {
@@ -535,6 +545,7 @@ DrvDetectInitRegistryStringValue(
 
     ValueData->Length = lengthBytes;
     ValueData->MaximumLength = lengthBytes;
+    return TRUE;
 }
 
 static
@@ -622,7 +633,76 @@ DrvDetectRegistryCallback(
     notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
     RtlZeroMemory(trackedImagePath, sizeof(trackedImagePath));
 
-    if (notifyClass != RegNtPreSetValueKey || Argument2 == NULL)
+    if (Argument2 == NULL)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    if (notifyClass == RegNtPreDeleteValueKey)
+    {
+        PREG_DELETE_VALUE_KEY_INFORMATION deleteInfo = (PREG_DELETE_VALUE_KEY_INFORMATION)Argument2;
+        PCUNICODE_STRING delKeyName = NULL;
+        ULONG_PTR delObjectId = 0;
+
+        if (deleteInfo->ValueName != NULL &&
+            DrvDetectEndsWithInsensitive(deleteInfo->ValueName, L"VulnerableDriverBlocklistEnable"))
+        {
+            if (NT_SUCCESS(CmCallbackGetKeyObjectIDEx(
+                    &g_DrvDetect.RegistryCookie, deleteInfo->Object, &delObjectId, &delKeyName, 0)) &&
+                delKeyName != NULL)
+            {
+                if (DrvDetectIsCiConfigRegistryPath(delKeyName))
+                {
+                    DrvDetectPushAlert(
+                        DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+                        HandleToULong(PsGetCurrentProcessId()),
+                        DrvDetectIsBlockingEnabled() ?
+                            L"Blocked attempt to delete VulnerableDriverBlocklistEnable value." :
+                            L"Observed attempt to delete VulnerableDriverBlocklistEnable value while blocking is off.");
+                    CmCallbackReleaseKeyObjectIDEx(delKeyName);
+                    if (DrvDetectIsBlockingEnabled())
+                    {
+                        return STATUS_ACCESS_DENIED;
+                    }
+                    return STATUS_SUCCESS;
+                }
+                CmCallbackReleaseKeyObjectIDEx(delKeyName);
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
+    if (notifyClass == RegNtPreRenameKey)
+    {
+        PREG_RENAME_KEY_INFORMATION renameInfo = (PREG_RENAME_KEY_INFORMATION)Argument2;
+        PCUNICODE_STRING renKeyName = NULL;
+        ULONG_PTR renObjectId = 0;
+
+        if (NT_SUCCESS(CmCallbackGetKeyObjectIDEx(
+                &g_DrvDetect.RegistryCookie, renameInfo->Object, &renObjectId, &renKeyName, 0)) &&
+            renKeyName != NULL)
+        {
+            if (DrvDetectIsCiConfigRegistryPath(renKeyName))
+            {
+                DrvDetectPushAlert(
+                    DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+                    HandleToULong(PsGetCurrentProcessId()),
+                    DrvDetectIsBlockingEnabled() ?
+                        L"Blocked attempt to rename CI\\Config registry key." :
+                        L"Observed attempt to rename CI\\Config registry key while blocking is off.");
+                CmCallbackReleaseKeyObjectIDEx(renKeyName);
+                if (DrvDetectIsBlockingEnabled())
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+                return STATUS_SUCCESS;
+            }
+            CmCallbackReleaseKeyObjectIDEx(renKeyName);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    if (notifyClass != RegNtPreSetValueKey)
     {
         return STATUS_SUCCESS;
     }
@@ -646,7 +726,20 @@ DrvDetectRegistryCallback(
     {
         WCHAR observedMsg[220];
 
-        DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize);
+        if (!DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize))
+        {
+            DrvDetectPushAlert(
+                DrvDetectIsBlockingEnabled() ? AlertTypeProcessBlocked : AlertTypeKernelImageSuspicious,
+                HandleToULong(PsGetCurrentProcessId()),
+                DrvDetectIsBlockingEnabled() ?
+                    L"Blocked oversized ImagePath registry value (possible evasion)." :
+                    L"Observed oversized ImagePath registry value while blocking is off.");
+            if (DrvDetectIsBlockingEnabled())
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            return STATUS_SUCCESS;
+        }
 
         RtlStringCchPrintfW(
             observedMsg,
@@ -747,7 +840,21 @@ DrvDetectRegistryCallback(
     {
         if (freeIndex < 0)
         {
+            LARGE_INTEGER oldest = { 0 };
+            oldest.QuadPart = MAXLONGLONG;
             freeIndex = 0;
+            for (i = 0; i < DRVDETECT_MAX_TRACKED_SERVICES; i++)
+            {
+                if (g_ServiceTracks[i].LastAccessTime.QuadPart < oldest.QuadPart)
+                {
+                    oldest = g_ServiceTracks[i].LastAccessTime;
+                    freeIndex = (LONG)i;
+                }
+            }
+            DrvDetectPushAlert(
+                AlertTypeKernelImageSuspicious,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"Service track table full, evicting LRU entry.");
         }
         matchIndex = freeIndex;
         RtlZeroMemory(&g_ServiceTracks[matchIndex], sizeof(g_ServiceTracks[matchIndex]));
@@ -758,6 +865,8 @@ DrvDetectRegistryCallback(
             keyName->Buffer,
             keyName->Length / sizeof(WCHAR));
     }
+
+    KeQuerySystemTimePrecise(&g_ServiceTracks[matchIndex].LastAccessTime);
 
     if (isTypeWrite && valueType == REG_DWORD && setInfo->DataSize >= sizeof(ULONG))
     {
@@ -775,18 +884,29 @@ DrvDetectRegistryCallback(
 
     if (isImagePathWrite && (valueType == REG_SZ || valueType == REG_EXPAND_SZ))
     {
-        DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize);
-        DrvDetectDescribeRegistryWrite(keyName, setInfo->ValueName, valueType, &valueData);
-
-        if (DrvDetectShouldBlockDriverServiceImagePath(&valueData))
+        if (!DrvDetectInitRegistryStringValue(&valueData, setInfo->Data, setInfo->DataSize))
         {
             g_ServiceTracks[matchIndex].HasSuspiciousImagePath = TRUE;
             immediateImagePathBlock = TRUE;
-            RtlStringCchCopyNW(
+            RtlStringCchCopyW(
                 g_ServiceTracks[matchIndex].ImagePath,
                 RTL_NUMBER_OF(g_ServiceTracks[matchIndex].ImagePath),
-                valueData.Buffer,
-                valueData.Length / sizeof(WCHAR));
+                L"<oversized>");
+        }
+        else
+        {
+            DrvDetectDescribeRegistryWrite(keyName, setInfo->ValueName, valueType, &valueData);
+
+            if (DrvDetectShouldBlockDriverServiceImagePath(&valueData))
+            {
+                g_ServiceTracks[matchIndex].HasSuspiciousImagePath = TRUE;
+                immediateImagePathBlock = TRUE;
+                RtlStringCchCopyNW(
+                    g_ServiceTracks[matchIndex].ImagePath,
+                    RTL_NUMBER_OF(g_ServiceTracks[matchIndex].ImagePath),
+                    valueData.Buffer,
+                    valueData.Length / sizeof(WCHAR));
+            }
         }
     }
 
@@ -1115,6 +1235,34 @@ DrvDetectCreateControlDevice(
     return STATUS_SUCCESS;
 }
 
+static
+BOOLEAN
+DrvDetectIsCallerAuthorized(
+    VOID
+)
+{
+    PEPROCESS process;
+    PUNICODE_STRING processPath = NULL;
+    NTSTATUS status;
+    BOOLEAN authorized = FALSE;
+
+    process = PsGetCurrentProcess();
+    if (process == NULL)
+    {
+        return FALSE;
+    }
+
+    status = SeLocateProcessImageName(process, &processPath);
+    if (!NT_SUCCESS(status) || processPath == NULL)
+    {
+        return FALSE;
+    }
+
+    authorized = DrvDetectEndsWithInsensitive(processPath, L"\\um.exe");
+    ExFreePool(processPath);
+    return authorized;
+}
+
 _Use_decl_annotations_
 VOID
 DrvDetectEvtFileCreate(
@@ -1125,6 +1273,12 @@ DrvDetectEvtFileCreate(
 {
     UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(FileObject);
+
+    if (DrvDetectIsCallerAuthorized())
+    {
+        g_DrvDetect.AuthorizedProcessId = PsGetCurrentProcessId();
+    }
+
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -1198,6 +1352,16 @@ DrvDetectEvtIoDeviceControl(
     }
     else if (IoControlCode == IOCTL_DRVDETECT_SET_STATE)
     {
+        if (PsGetCurrentProcessId() != g_DrvDetect.AuthorizedProcessId)
+        {
+            DrvDetectPushAlert(
+                AlertTypeProcessBlocked,
+                HandleToULong(PsGetCurrentProcessId()),
+                L"Unauthorized process attempted to change blocking state via IOCTL.");
+            status = STATUS_ACCESS_DENIED;
+            goto Exit;
+        }
+
         if (InputBufferLength < sizeof(DRVDETECT_STATE))
         {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -1252,6 +1416,15 @@ DrvDetectEvtDriverUnload(
 {
     UNREFERENCED_PARAMETER(Driver);
 
+    if (InterlockedCompareExchange(&g_DrvDetect.LockState, 0, 0) != 0 &&
+        DrvDetectIsBlockingEnabled())
+    {
+        DrvDetectPushAlert(
+            AlertTypeProcessBlocked,
+            HandleToULong(PsGetCurrentProcessId()),
+            L"Driver unload attempted while lock is active. Unloading anyway (WDF limitation).");
+    }
+
     if (g_DrvDetect.ProcessNotifyRegistered)
     {
         PsSetCreateProcessNotifyRoutineEx(DrvDetectProcessNotifyEx, TRUE);
@@ -1299,6 +1472,7 @@ DriverEntry(
     KeInitializeSpinLock(&g_DrvDetect.AlertLock);
     KeInitializeSpinLock(&g_DrvDetect.ServiceTrackLock);
     InterlockedExchange(&g_DrvDetect.BlockingState, DrvDetectBlockingOn);
+    InterlockedExchange(&g_DrvDetect.LockState, 1);
     DrvDetectPushAlert(
         AlertTypeKernelImageSuspicious,
         0,
@@ -1306,7 +1480,7 @@ DriverEntry(
 
     WDF_DRIVER_CONFIG_INIT(&config, WDF_NO_EVENT_CALLBACK);
     config.DriverInitFlags = WdfDriverInitNonPnpDriver;
-    config.EvtDriverUnload = DrvDetectEvtDriverUnload;
+    config.EvtDriverUnload = NULL;
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
 

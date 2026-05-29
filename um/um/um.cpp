@@ -5,6 +5,7 @@
 #include "shared.h"
 
 #include <d3d11.h>
+#include <wincrypt.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
@@ -23,6 +24,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 struct UiAlert
 {
@@ -72,6 +74,10 @@ static constexpr float kPanelPadding = 20.0f;
 static bool g_WebShutdownRequested = false;
 static constexpr unsigned short kDefaultWebPort = 8080;
 static unsigned short g_WebPort = kDefaultWebPort;
+static std::string g_WebAuthToken;
+
+// SHA-256 hash of the trusted km.sys binary. Update this after each driver build.
+static const char* kExpectedDriverHash = "0000000000000000000000000000000000000000000000000000000000000000";
 
 static std::wstring GetExecutableDirectory();
 static std::wstring JoinPath(const std::wstring& base, const wchar_t* name);
@@ -341,7 +347,7 @@ static void SendHttpResponse(SOCKET socketHandle, const char* status, const char
     headers += contentType;
     headers += "\r\nContent-Length: ";
     headers += std::to_string(body.size());
-    headers += "\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    headers += "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
 
     SendAll(socketHandle, headers.c_str(), static_cast<int>(headers.size()));
     SendAll(socketHandle, body.c_str(), static_cast<int>(body.size()));
@@ -479,7 +485,7 @@ async function refresh(){
   }
 }
 async function setBlocking(enabled){
-  await fetch(`/api/blocking?enabled=${enabled?1:0}`,{method:'POST'});
+  await fetch(`/api/blocking?enabled=${enabled?1:0}`,{method:'POST',headers:{'X-Auth-Token':window.__TOKEN}});
   await refresh();
 }
 document.getElementById('enableBtn').addEventListener('click',()=>setBlocking(true));
@@ -487,7 +493,7 @@ document.getElementById('disableBtn').addEventListener('click',()=>setBlocking(f
 document.getElementById('refreshBtn').addEventListener('click',refresh);
 document.getElementById('shutdownBtn').addEventListener('click',async()=>{
   if(!confirm('Stop the DrvDetect web server?')){return;}
-  await fetch('/api/shutdown',{method:'POST'});
+  await fetch('/api/shutdown',{method:'POST',headers:{'X-Auth-Token':window.__TOKEN}});
   els.statusLine.textContent='Shutdown requested';
 });
 refresh();
@@ -495,7 +501,62 @@ setInterval(refresh,1000);
 </script>
 </body>
 </html>)HTML";
+
+    page.insert(page.find("<script>") + 8, "\nwindow.__TOKEN='" + g_WebAuthToken + "';\n");
     return page;
+}
+
+static std::string GenerateAuthToken()
+{
+    HCRYPTPROV hProv = 0;
+    BYTE randomBytes[32] = {};
+    std::string token;
+    token.reserve(64);
+
+    if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+    {
+        CryptGenRandom(hProv, sizeof(randomBytes), randomBytes);
+        CryptReleaseContext(hProv, 0);
+    }
+    else
+    {
+        LARGE_INTEGER counter = {};
+        QueryPerformanceCounter(&counter);
+        DWORD pid = GetCurrentProcessId();
+        DWORD tick = GetTickCount();
+        memcpy(randomBytes, &counter, sizeof(counter));
+        memcpy(randomBytes + 8, &pid, sizeof(pid));
+        memcpy(randomBytes + 12, &tick, sizeof(tick));
+    }
+
+    const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i)
+    {
+        token.push_back(hex[(randomBytes[i] >> 4) & 0x0F]);
+        token.push_back(hex[randomBytes[i] & 0x0F]);
+    }
+
+    return token;
+}
+
+static bool RequestHasValidToken(const std::string& request)
+{
+    const std::string headerName = "X-Auth-Token: ";
+    size_t pos = request.find(headerName);
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t valueStart = pos + headerName.size();
+    size_t valueEnd = request.find("\r\n", valueStart);
+    if (valueEnd == std::string::npos)
+    {
+        valueEnd = request.size();
+    }
+
+    std::string providedToken = request.substr(valueStart, valueEnd - valueStart);
+    return providedToken == g_WebAuthToken;
 }
 
 static void HandleHttpRequest(SOCKET clientSocket)
@@ -565,6 +626,12 @@ static void HandleHttpRequest(SOCKET clientSocket)
 
     if (method == "POST" && path == "/api/blocking")
     {
+        if (!RequestHasValidToken(request))
+        {
+            SendHttpResponse(clientSocket, "403 Forbidden", "application/json; charset=utf-8", "{\"error\":\"invalid token\"}");
+            return;
+        }
+
         const std::string enabledValue = GetQueryValue(query, "enabled");
         const unsigned long blockingState = enabledValue == "1" || enabledValue == "true" ? DrvDetectBlockingOn : DrvDetectBlockingOff;
         if (!SetBlockingState(blockingState))
@@ -580,6 +647,12 @@ static void HandleHttpRequest(SOCKET clientSocket)
 
     if (method == "POST" && path == "/api/shutdown")
     {
+        if (!RequestHasValidToken(request))
+        {
+            SendHttpResponse(clientSocket, "403 Forbidden", "application/json; charset=utf-8", "{\"error\":\"invalid token\"}");
+            return;
+        }
+
         g_WebShutdownRequested = true;
         SendHttpResponse(clientSocket, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
         return;
@@ -591,6 +664,7 @@ static void HandleHttpRequest(SOCKET clientSocket)
 static int RunWebServer(unsigned short port)
 {
     g_WebPort = port;
+    g_WebAuthToken = GenerateAuthToken();
 
     WSADATA wsaData = {};
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -1067,6 +1141,68 @@ static bool FileExists(const std::wstring& path)
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+static bool VerifyFileSha256(const std::wstring& filePath, const char* expectedHexHash)
+{
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    BYTE fileBuffer[4096];
+    BYTE hashValue[32];
+    DWORD hashLen = 32;
+    DWORD bytesRead = 0;
+    bool result = false;
+
+    hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash))
+    {
+        CryptReleaseContext(hProv, 0);
+        CloseHandle(hFile);
+        return false;
+    }
+
+    while (ReadFile(hFile, fileBuffer, sizeof(fileBuffer), &bytesRead, nullptr) && bytesRead > 0)
+    {
+        if (!CryptHashData(hHash, fileBuffer, bytesRead, 0))
+        {
+            goto cleanup;
+        }
+    }
+
+    if (!CryptGetHashParam(hHash, HP_HASHVAL, hashValue, &hashLen, 0) || hashLen != 32)
+    {
+        goto cleanup;
+    }
+
+    {
+        char computedHex[65] = {};
+        const char hex[] = "0123456789abcdef";
+        for (DWORD i = 0; i < 32; ++i)
+        {
+            computedHex[i * 2] = hex[(hashValue[i] >> 4) & 0x0F];
+            computedHex[i * 2 + 1] = hex[hashValue[i] & 0x0F];
+        }
+        computedHex[64] = '\0';
+        result = _stricmp(computedHex, expectedHexHash) == 0;
+    }
+
+cleanup:
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    CloseHandle(hFile);
+    return result;
+}
+
 static bool RunProcessAndWait(const std::wstring& commandLine, DWORD* exitCodeOut = nullptr)
 {
     STARTUPINFOW startupInfo = {};
@@ -1129,6 +1265,17 @@ static bool EnsureDriverInstalledAndRunning()
         g_App.StatusLine = L"Driver files were not found next to um.exe";
         AppendInstallerLog(g_App.StatusLine);
         return false;
+    }
+
+    if (strcmp(kExpectedDriverHash, "0000000000000000000000000000000000000000000000000000000000000000") != 0)
+    {
+        if (!VerifyFileSha256(sysPath, kExpectedDriverHash))
+        {
+            g_App.StatusLine = L"Driver binary hash mismatch - possible tampering";
+            AppendInstallerLog(g_App.StatusLine);
+            return false;
+        }
+        AppendInstallerLog(L"Driver hash verified");
     }
 
     AppendInstallerLog(L"Bootstrap started");
