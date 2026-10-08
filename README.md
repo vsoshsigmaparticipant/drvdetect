@@ -1,5 +1,7 @@
 # DrvDetect
 
+Project made by Taran Maxim Vladimirovich
+
 DrvDetect is a Windows prototype for early detection of suspicious driver-loading activity. The project monitors low-level system events related to process creation, kernel image loading, and registry modifications in order to identify potentially dangerous or unauthorized driver-loading scenarios.
 
 ## Overview
